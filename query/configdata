@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+
+if [[ -z "${REEVE_TAG_PRESTO_ROLE}" ]]; then
+  echo "I'm not a Presto node. Ignoring member join."
+  exit 0
+fi
+
+# Only the Presto Coordinator is allow to provide this information
+if [[ "${REEVE_TAG_PRESTO_ROLE}" != "coordinator" ]]; then
+  echo "I'm not the Presto coordinator, I'm a Presto ${REEVE_TAG_PRESTO_ROLE}. Ignoring configuration data request."
+  exit 0
+fi
+
+SCRIPT_DIR="$( cd "$( dirname "$0" )" && pwd )"
+
+# Load global and coordinator settings
+source ${SCRIPT_DIR}/../config/global.conf
+[[ -e ${SCRIPT_DIR}/../config/worker.conf ]] && source ${SCRIPT_DIR}/../config/worker.conf
+
+# Provide the information, in the format: var1=val1;var2=val2;
+echo -n "httpport=${HTTP_SERVER_PORT};"
+echo -n "querymaxmem=${QUERY_MAX_MEMORY};"
+echo -n "querymaxmempernode=${QUERY_MAX_MEMORY_PER_NODE};"
+echo

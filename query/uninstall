@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+if [[ -z "${REEVE_TAG_PRESTO_ROLE}" ]]; then
+  echo "I'm not a Presto node. Ignoring member join."
+  exit 0
+fi
+
+presto_pkg_name=$(rpm -qa | grep presto | head -1)
+[[ -n ${presto_pkg_name} ]] && rpm -e ${presto_pkg_name}
+
+java_pkg_name=$(rpm -qa | grep jdk1.8 | head -1)
+[[ -n ${java_pkg_name} ]] && rpm -e ${java_pkg_name}
+
+if rpm -qa | grep -q presto
+then
+  echo "Failed to unistall Presto Server"  >&2
+  exit 1
+fi
+
+if rpm -qa | grep -q jdk1.8
+then
+  echo "Failed to unistall Java 8" >&2
+  exit 1
+fi
+
+# echo "Java 8 and Presto Server uninstalled"
+echo "DONE"

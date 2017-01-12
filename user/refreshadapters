@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+
+if [[ -z "${REEVE_TAG_PRESTO_ROLE}" ]]; then
+  echo "I'm not a Presto node, ignoring refresh adapters request."
+  exit 0
+fi
+
+restart=false
+coordinator=`serf members | grep 'presto_role=coordinator' | awk '{print \$1}'`
+adapters=$(serf query -no-ack -node ${coordinator} presto/listadapters | grep output | sed 's/.*"output":"\(.*\)",.*/\1/')
+for adapter in ${adapters}; do
+  if [[ ! -e /etc/presto/catalog/${adapter}.properties ]]; then
+    params=$(serf query -no-ack -node ${adapter}-presto-adapter/properties | while read line; do echo $line | grep 'output' | sed 's/.*"output":"\(.*\)",.*/\1/'; done)
+    if [[ -z $params ]]; then
+      echo "Cannot get ${adapter} properties data from $adapter_hostname. Try later." >&2
+    else
+      mkdir -p /etc/presto/catalog
+      echo $params | tr ';' '\n' > /etc/presto/catalog/${adapter}.properties
+      echo -n "Adapter ${adapter} refreshed. "
+      restart=true
+    fi
+  fi
+done
+
+# If a change was done and Presto Server is running/installed, then restart it to take the adapter.
+if [[ ${restart} == true ]]; then
+  if [[ -e /etc/init.d/presto ]]; then
+    /etc/init.d/presto status | grep -q Running && /etc/init.d/presto restart
+  fi
+fi

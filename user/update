@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+
+if [[ -z "${REEVE_TAG_PRESTO_ROLE}" ]]; then
+  echo "I'm not a Presto node, ignoring member join."
+  exit 0
+fi
+
+if [[ "${REEVE_TAG_PRESTO_ROLE}" == "coordinator" ]]; then
+  echo "I'm the Presto coordinator, ignoring update request."
+  exit 0
+fi
+
+SCRIPT_DIR="$( cd "$( dirname "$0" )" && pwd )"
+
+source ${SCRIPT_DIR}/../config/global.conf
+[[ -e ${SCRIPT_DIR}/../config/worker.conf ]] && source ${SCRIPT_DIR}/../config/worker.conf
+
+restart=false
+
+mkdir -p ${DOWNLOADS_DIR}
+
+coordinator=`serf members | grep 'presto_role=coordinator' | awk '{print \$1}'`
+
+params=$(serf query -no-ack -node $coordinator presto/installdata | while read line; do echo $line | grep 'output' | sed 's/.*"output":"\(.*\)",.*/\1/'; done)
+
+if [[ -z $params ]]; then
+  echo "Cannot get install data from coordinator." >&2
+  exit 1
+fi
+
+# Just for debuging
+echo $params >> /tmp/member_join.txt
+# Get variables from parameters received:
+#   prestourl
+#   prestomd5sum
+#   javaurl
+#   javamd5sum
+IFS=\; read -a fields <<<"$params"
+for f in "${fields[@]}"; do
+  param=${f%%=*}
+  value=${f##*=}
+  eval "${param}='${value}'"
+done
+
+javainstalledversion=$(java -version 2>&1 | head -1 | sed 's/.*"\(.*\)".*/\1/')
+if [[ ${javainstalledversion} != ${javaversion} ]]; then
+  rpmaction="-i"
+  [[ -n ${javainstalledversion} ]] && rpmaction="-U"
+
+  filename=${javaurl##*/}
+  curl -s -L --header "Cookie: gpw_e24=http%3A%2F%2Fwww.oracle.com%2F; oraclelicense=accept-securebackup-cookie" \
+    ${javaurl} -o ${DOWNLOADS_DIR}/${filename}
+  if ! echo "${javamd5sum}  ${DOWNLOADS_DIR}/${filename}" | md5sum -c --quiet - &>/dev/null; then
+    echo "Checksum for ${filename} do NOT match." >&2
+    exit 1
+  fi
+  rpm ${rpmaction} ${DOWNLOADS_DIR}/${filename} 2>&1 >/dev/null
+  restart=true
+fi
+
+prestoinstalledversion=$(rpm -aq | grep presto | sed 's/presto-server-rpm-\(.*\).x86_64/\1/')
+if [[ ${prestoinstalledversion} != ${prestoversion} ]]; then
+  rpmaction="-i"
+  [[ -n ${prestoinstalledversion} ]] && rpmaction="-U"
+
+  filename=${prestourl##*/}
+  curl -s ${prestourl} -o ${DOWNLOADS_DIR}/${filename}
+  if ! echo "${prestomd5sum}  ${DOWNLOADS_DIR}/${filename}" | md5sum -c --quiet - &>/dev/null; then
+    echo "Checksum for ${filename} do NOT match." >&2
+    exit 1
+  fi
+  rpm ${rpmaction} ${DOWNLOADS_DIR}/${filename} 2>&1 >/dev/null
+  restart=true
+
+  # prestoversion=$(echo $prestourl | sed 's|.*/presto/\(.*\)/presto-server.*|\1|')
+  prestoinstalledversion=$(rpm -aq | grep presto | sed 's/presto-server-rpm-\(.*\).x86_64/\1/')
+  echo -n "Presto Server v${prestoinstalledversion} sucessfully updated"
+fi
+
+params=$(serf query -no-ack -node $coordinator presto/configdata | while read line; do echo $line | grep 'output' | sed 's/.*"output":"\(.*\)",.*/\1/'; done)
+if [[ -z $params ]]; then
+  echo " -> Cannot get config data from coordinator." >&2
+  exit 1
+fi
+
+# Get variables from parameters received:
+IFS=\; read -a fields <<<"$params"
+for f in "${fields[@]}"; do
+  param=${f%%=*}
+  value=${f##*=}
+  eval "${param}='${value}'"
+done
+
+coordinatorIP=`serf members | grep 'presto_role=coordinator' | awk '{print \$2}' | cut -f1 -d:`
+discoveryuri="http://${coordinatorIP}:${httpport}"
+
+cat <<-EOCONFC > /etc/presto/config.properties.new
+coordinator=false
+http-server.http.port=${httpport}
+query.max-memory=${querymaxmem}
+query.max-memory-per-node=${querymaxmempernode}
+discovery.uri=${discoveryuri}
+EOCONFC
+
+if diff -q /etc/presto/config.properties /etc/presto/config.properties.new &>/dev/null; then
+  echo -n " -> Configuration changed"
+  mv /etc/presto/config.properties.new /etc/presto/config.properties
+  restart=true
+else
+  rm -f /etc/presto/config.properties.new
+fi
+
+if [[ "${restart}" == "true" ]]; then
+  echo -n " -> Presto Server restarted"
+  /etc/init.d/presto restart &>/dev/null
+fi
+
+echo "."

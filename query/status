@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+if [[ -z "${REEVE_TAG_PRESTO_ROLE}" ]]; then
+  if [[ -n "${REEVE_TAG_PRESTO_ADAPTER}" ]]; then
+    echo "Presto Adapter: ${REEVE_TAG_PRESTO_ADAPTER};"
+    exit 0
+  fi
+  echo "Not a Presto or Presto Adapter node."
+  exit 0
+fi
+
+javainstalledversion=$(java -version 2>&1 | head -1 | sed 's/.*"\(.*\)".*/\1/')
+if [[ -n ${javainstalledversion} ]]; then
+  echo -n "Java version: ${javainstalledversion};"
+else
+  echo -n "Java NOT installed;"
+fi
+
+prestoinstalledversion=$(rpm -aq | grep presto | sed 's/presto-server-rpm-\(.*\).x86_64/\1/')
+if [[ -n ${prestoinstalledversion} ]]; then
+  echo -n "Presto Server version: ${prestoinstalledversion};"
+else
+  echo -n "Presto Server NOT installed;"
+  exit 0
+fi
+
+if [[ -x /root/bin/presto ]]; then
+  echo -n "Presto CLI version: $(/root/bin/presto --version);"
+else
+  echo -n "Presto CLI NOT installed;"
+fi
+
+status=$(/etc/init.d/presto status | tail -n +2)
+echo -n "Presto Server status: ${status};"
+
+role='Coordinator'
+grep -q '^coordinator=false$' /etc/presto/config.properties && role='Worker'
+echo -n "Presto Role: ${role};"
+
+list=$(ls -1 /etc/presto/catalog/*.properties | sed 's|/etc/presto/catalog/\(.*\).properties|\1|' | tr '\n' ',')
+if [[ -n ${list} ]]; then
+  echo -n "Adapters: ${list::-1};"
+else
+  echo -n "Adapters: NONE;"
+fi
+
+echo

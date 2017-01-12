@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+
+if [[ -z "${REEVE_TAG_PRESTO_ROLE}" ]]; then
+  echo "I'm not a Presto node. Ignoring member join."
+  exit 0
+fi
+
+# Only the Presto Coordinator is allow to provide this information
+if [ "${REEVE_TAG_PRESTO_ROLE}" != "coordinator" ]; then
+  echo "I'm not the Presto coordinator, I'm a Presto ${REEVE_TAG_PRESTO_ROLE}. Ignoring installation data request."
+  exit 0
+fi
+
+SCRIPT_DIR="$( cd "$( dirname "$0" )" && pwd )"
+
+# Load global and coordinator settings
+source ${SCRIPT_DIR}/../config/global.conf
+[[ -e ${SCRIPT_DIR}/../config/coordinator.conf ]] && source ${SCRIPT_DIR}/../config/coordinator.conf
+
+# Provide the information, in the format: var1=val1;var2=val2;
+echo -n "prestoversion=${PRESTO_SERVER_RPM_VERSION};"
+echo -n "prestourl=${PRESTO_SERVER_URL};"
+echo -n "prestomd5sum=${PRESTO_SERVER_MD5SUM};"
+echo -n "javaversion=${JAVA_8_APP_VERSION};"
+echo -n "javaurl=${JAVA_8_URL};"
+echo -n "javamd5sum=${JAVA_8_MD5SUM};"
+echo

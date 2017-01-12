@@ -1,0 +1,260 @@
+#!/usr/bin/env bash
+
+if [[ -z "${REEVE_TAG_PRESTO_ROLE}" ]]; then
+  echo "I'm not a Presto node, ignoring member join."
+  exit 0
+fi
+
+SCRIPT_DIR="$( cd "$( dirname "$0" )" && pwd )"
+
+# Load global settings
+source ${SCRIPT_DIR}/../config/global.conf
+
+# Identify local IP address
+ipAddr=
+getIPAddr() {
+  # If this is a container, this is the way to get the IP address
+  ipAddr=$(grep $HOSTNAME /etc/hosts 2>/dev/null| cut -f1)
+  [[ -n $ipAddr ]] && return 0
+
+  # Other option with ping, for containers and hosts:
+  ipAddr=$(ping -q -c 1 $(hostname) | head -1 | sed 's/.* (\(.*\)):.*/\1/')
+  [[ -n $ipAddr ]] && return 0
+
+  # If this is not a container, then it is a linux server
+  ipAddr=$(ip addr show eth0 2>/dev/null | grep "inet " | awk '{print $2}' | cut -d/ -f1)
+  [[ -n $ipAddr ]] && return 0
+
+  ipAddr=$(ifconfig eth0 | grep "inet " | awk '{print $2}' | cut -d: -f2)
+  [[ -n $ipAddr ]] && return 0
+
+  return 1
+}
+getIPAddr || (
+  echo "Cannot get my IP address"
+  (( $keeptmp )) && rm -f $tmpfile
+  exit 0
+)
+
+
+tmpfile=$(mktemp /tmp/$(basename "$0").XXXX)
+logfile=$(mktemp /tmp/$(basename "$0").XXXX.log)
+keeptmp=0
+# exec 3>"$tmpfile"
+# rm "$tmpfile"
+
+adapters=
+while read line; do
+  c=`echo $line | grep 'presto_role=coordinator' | awk '{print \$1}'`
+  if [[ -n $(echo $line | grep 'presto_adapter=') ]]; then
+    tags=$(echo $line | grep 'presto_adapter=' | awk '{print $4}')
+    adapter_hostname=$(echo $line | grep 'presto_adapter=' | awk '{print $1}')
+    adapters="presto_adapter_hostname=${adapter_hostname},${tags}:${adapters}"
+  fi
+  [[ -n $c ]] && coordinator=$c
+  echo $line >>$tmpfile
+done
+adapters=${adapters::-1}
+
+# If one of new guys is an adapter
+if [[ -n ${adapters} ]]; then
+  IFS=:
+  for tags in ${adapters}; do
+    IFS=,
+    for f in $tags; do
+      [[ ${f%%=*} == "presto_adapter_hostname" ]] && adapter_hostname=${f##*=}
+      [[ ${f%%=*} == "presto_adapter" ]] && adapter=${f##*=} && break
+    done;
+    if [[ -n ${adapter} ]]; then
+      IFS=\
+      params=$(serf query -no-ack -node $adapter_hostname ${adapter}-presto-adapter/properties | while read line; do echo $line | grep 'output' | sed 's/.*"output":"\(.*\)",.*/\1/'; done)
+      if [[ -z $params ]]; then
+        echo "Cannot get ${adapter} properties data from $adapter_hostname. Try later." >&2
+      else
+        mkdir -p /etc/presto/catalog
+        echo $params | tr ';' '\n' > /etc/presto/catalog/${adapter}.properties
+        # If Presto Server is running/installed, then restart it to take the adapter.
+        if [[ -e /etc/init.d/presto ]]; then
+          /etc/init.d/presto status | grep -q Running && /etc/init.d/presto restart
+        fi
+      fi
+    fi
+  done
+fi
+
+# Identify if I'm already in the cluster or if I'm the new guy
+if ! grep -q $ipAddr $tmpfile; then
+  echo "I'm already in the cluster, ignoring member join."
+  (( $keeptmp )) && rm -f $tmpfile
+  exit 0
+fi
+
+## Installation:
+
+# Create directory to download packages/rpms
+mkdir -p ${DOWNLOADS_DIR}
+
+# Load coordinator or worker settings (if any) and get install settings from coordinator (if I'm a worker) or locally (if I'm the coordinator)
+if [ "${REEVE_TAG_PRESTO_ROLE}" != "coordinator" ]; then
+  [[ -e ${SCRIPT_DIR}/../config/worker.conf ]] && source ${SCRIPT_DIR}/../config/worker.conf
+
+  params=$(serf query -no-ack -node $coordinator presto/installdata | while read line; do echo $line | grep 'output' | sed 's/.*"output":"\(.*\)",.*/\1/'; done)
+  if [[ -z $params ]]; then
+    echo "Cannot get install data from coordinator. Using defaults" >&2
+    params="prestoversion=${PRESTO_SERVER_RPM_VERSION};prestourl=${PRESTO_SERVER_URL};prestomd5sum=${PRESTO_SERVER_MD5SUM};javaversion=${JAVA_8_APP_VERSION};javaurl=${JAVA_8_URL};javamd5sum=${JAVA_8_MD5SUM};"
+  fi
+else
+  [[ -e ${SCRIPT_DIR}/../config/coordinator.conf ]] && source ${SCRIPT_DIR}/../config/coordinator.conf
+
+  params="prestoversion=${PRESTO_SERVER_RPM_VERSION};prestourl=${PRESTO_SERVER_URL};prestomd5sum=${PRESTO_SERVER_MD5SUM};javaversion=${JAVA_8_APP_VERSION};javaurl=${JAVA_8_URL};javamd5sum=${JAVA_8_MD5SUM};"
+fi
+
+# Just for debuging:
+# echo $params >>$logfile
+
+# Get variables from install parameters
+IFS=\; read -a fields <<<"$params"
+for f in "${fields[@]}"; do
+  param=${f%%=*}
+  value=${f##*=}
+  eval "${param}='${value}'"
+done
+
+# Install or Upgrade Java 8 Oracle (if required)
+javainstalledversion=$(java -version 2>&1 | head -1 | sed 's/.*"\(.*\)".*/\1/')
+if [[ ${javainstalledversion} != ${javaversion} ]]; then
+  rpmaction="-i"
+  [[ -n ${javainstalledversion} ]] && rpmaction="-U"
+
+  filename=${javaurl##*/}
+  curl -s -L --header "Cookie: gpw_e24=http%3A%2F%2Fwww.oracle.com%2F; oraclelicense=accept-securebackup-cookie" \
+    ${javaurl} -o ${DOWNLOADS_DIR}/${filename}
+  if ! echo "${javamd5sum}  ${DOWNLOADS_DIR}/${filename}" | md5sum -c --quiet - &>/dev/null; then
+    echo "Checksum for ${filename} do NOT match" >&2
+    exit 1
+  fi
+  rpm ${rpmaction} ${DOWNLOADS_DIR}/${filename} 2>&1 >/dev/null
+fi
+
+# Install or Upgrade Presto Server (if required)
+prestoinstalledversion=$(rpm -aq | grep presto | sed 's/presto-server-rpm-\(.*\).x86_64/\1/')
+if [[ ${prestoinstalledversion} == ${prestoversion} ]]; then
+  echo "Presto Server v${prestoinstalledversion} exists and is the latest version"
+  exit 0
+fi
+rpmaction="-i"
+msgaction="install"
+[[ -n ${prestoinstalledversion} ]] && rpmaction="-U" && msgaction="upgrade"
+
+filename=${prestourl##*/}
+curl -s ${prestourl} -o ${DOWNLOADS_DIR}/${filename}
+if ! echo "${prestomd5sum}  ${DOWNLOADS_DIR}/${filename}" | md5sum -c --quiet - &>/dev/null; then
+  echo "Checksum for ${filename} do NOT match" >&2
+  exit 1
+fi
+rpm ${rpmaction} ${DOWNLOADS_DIR}/${filename} 2>&1 >/dev/null
+
+# Verify Presto was installed sucessfully
+prestoinstalledversion=$(rpm -aq | grep presto | sed 's/presto-server-rpm-\(.*\).x86_64/\1/')
+if [[ ${prestoinstalledversion} != ${prestoversion} ]]; then
+  echo "Presto Server ${msgaction} fail. (${prestoinstalledversion} != ${prestoversion})" >&2
+  exit 1
+fi
+
+# If I'm the Coordinator install the Presto CLI (if required)
+if [[ "${REEVE_TAG_PRESTO_ROLE}" == "coordinator" ]]; then
+  msgaction="install"
+  if [[ -x /root/bin/presto ]]; then
+    msgaction="update"
+    prestocliinstalledversion=$(/root/bin/presto --version)
+    if [[ ${prestocliinstalledversion} == "Presto CLI ${PRESTO_CLI_VERSION}" ]]; then
+      echo "Presto CLI v${prestocliinstalledversion} exists and is the latest version"
+      exit 0
+    fi
+  fi
+  filename=${PRESTO_CLI_URL##*/}
+  curl -s ${PRESTO_CLI_URL} -o ${DOWNLOADS_DIR}/${filename}
+  if ! echo "${PRESTO_CLI_MD5SUM}  ${DOWNLOADS_DIR}/${filename}" | md5sum -c --quiet - &>/dev/null; then
+    echo "Checksum for ${filename} do NOT match" >&2
+    exit 1
+  fi
+  mkdir -p /root/bin
+  \cp ${DOWNLOADS_DIR}/${filename} /root/bin/presto
+  chmod +x /root/bin/presto
+
+  # Verify Presto CLI was installed sucessfully
+  prestocliinstalledversion=$(/root/bin/presto --version)
+  if [[ ${prestocliinstalledversion} != "Presto CLI ${PRESTO_CLI_VERSION}" ]]; then
+    echo "Presto CLI ${msgaction} fail. (${prestocliinstalledversion} != ${PRESTO_CLI_VERSION})" >&2
+    exit 1
+  fi
+fi
+
+
+## Configuration:
+##  Configuration is only required if this is the first time (a join). Only if Java, Presto Server and Presto CLI were installed/updated.
+##  If they were not installed/updated and a configuration refresh is required, then use event presto/config
+
+# Load worker or coordinator settings and get configuration data from the coordinator (if I'm a worker) or locally (if I'm the coordinator)
+if [ "${REEVE_TAG_PRESTO_ROLE}" != "coordinator" ]; then
+  [[ -e ${SCRIPT_DIR}/../config/worker.conf ]] && source ${SCRIPT_DIR}/../config/worker.conf
+
+  # Idenfiy who's the Presto coordinator
+  coordinator=`serf members | grep 'presto_role=coordinator' | awk '{print \$1}'`
+
+  params=$(serf query -no-ack -node $coordinator presto/configdata | while read line; do echo $line | grep 'output' | sed 's/.*"output":"\(.*\)",.*/\1/'; done)
+  if [[ -z $params ]]; then
+    echo "Cannot get config data from coordinator. Using local default data" >&2
+    params="httpport=${HTTP_SERVER_PORT};querymaxmem=${QUERY_MAX_MEMORY};querymaxmempernode=${QUERY_MAX_MEMORY_PER_NODE};"
+  fi
+else
+  [[ -e ${SCRIPT_DIR}/../config/coordinator.conf ]] && source ${SCRIPT_DIR}/../config/coordinator.conf
+
+  params="httpport=${HTTP_SERVER_PORT};querymaxmem=${QUERY_MAX_MEMORY};querymaxmempernode=${QUERY_MAX_MEMORY_PER_NODE};"
+fi
+
+# Get variables from parameters received:
+IFS=\; read -a fields <<<"$params"
+for f in "${fields[@]}"; do
+  param=${f%%=*}
+  value=${f##*=}
+  eval "${param}='${value}'"
+done
+
+# Idenfiy Presto coordinator IP
+coordinatorIP=`serf members | grep 'presto_role=coordinator' | awk '{print \$2}' | cut -f1 -d:`
+
+# Define global properties
+discoveryuri="http://${coordinatorIP}:${httpport}"
+
+# Write configuration properties depending of the role
+if [ "${REEVE_TAG_PRESTO_ROLE}" == "coordinator" ]; then
+cat <<-EOCONFW > /etc/presto/config.properties
+coordinator=true
+node-scheduler.include-coordinator=false
+http-server.http.port=${httpport}
+query.max-memory=${querymaxmem}
+query.max-memory-per-node=${querymaxmempernode}
+discovery-server.enabled=true
+discovery.uri=${discoveryuri}
+EOCONFW
+else
+cat <<-EOCONFC > /etc/presto/config.properties
+coordinator=false
+http-server.http.port=${httpport}
+query.max-memory=${querymaxmem}
+query.max-memory-per-node=${querymaxmempernode}
+discovery.uri=${discoveryuri}
+EOCONFC
+fi
+
+# Output:
+echo -n "Presto Server v${prestoinstalledversion} ${msgaction} and config done. "
+
+## Start Presto Server:
+
+pid=$(/etc/init.d/presto restart | sed 's/Started as .*/\1/')
+
+echo "Presto Server Running (${pid})."
+
+(( $keeptmp )) && rm -f $tmpfile

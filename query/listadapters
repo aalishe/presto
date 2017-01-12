@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+if [[ -z "${REEVE_TAG_PRESTO_ROLE}" ]]; then
+  echo "I'm not a Presto node. Ignoring list adapters request."
+  exit 0
+fi
+
+# Only the Presto Coordinator is allow to provide this information
+if [[ "${REEVE_TAG_PRESTO_ROLE}" != "coordinator" ]]; then
+  echo "I'm not the Presto coordinator, I'm a Presto ${REEVE_TAG_PRESTO_ROLE}. Ignoring configuration data request."
+  exit 0
+fi
+
+list=$(ls -1 /etc/presto/catalog/*.properties | sed 's|/etc/presto/catalog/\(.*\).properties|\1|' | tr '\n' ';')
+echo ${list::-1}

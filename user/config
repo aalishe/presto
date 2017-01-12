@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+
+if [[ -z "${REEVE_TAG_PRESTO_ROLE}" ]]; then
+  echo "I'm not a Presto node, ignoring member join."
+  exit 0
+fi
+
+# Only a worker can configure Presto??
+# if [[ "${REEVE_TAG_PRESTO_ROLE}" == "coordinator" ]]; then
+#   echo "I'm the Presto coordinator. Ignoring config request."
+#   exit 0
+# fi
+
+SCRIPT_DIR="$( cd "$( dirname "$0" )" && pwd )"
+
+# Load global settings
+source ${SCRIPT_DIR}/../config/global.conf
+
+# Load worker or coordinator settings and get configuration data from the coordinator (if I'm a worker) or locally (if I'm the coordinator)
+if [ "${REEVE_TAG_PRESTO_ROLE}" != "coordinator" ]; then
+  [[ -e ${SCRIPT_DIR}/../config/worker.conf ]] && source ${SCRIPT_DIR}/../config/worker.conf
+
+  # Idenfiy who's the Presto coordinator
+  coordinator=`serf members | grep 'presto_role=coordinator' | awk '{print \$1}'`
+
+  params=$(serf query -no-ack -node $coordinator presto/configdata | while read line; do echo $line | grep 'output' | sed 's/.*"output":"\(.*\)",.*/\1/'; done)
+  if [[ -z $params ]]; then
+    echo "Cannot get config data from coordinator, local default data used" >&2
+    params="httpport=${HTTP-SERVER.HTTP.PORT};querymaxmem=${QUERY.MAX-MEMORY};querymaxmempernode=${QUERY.MAX-MEMORY-PER-NODE};discoveryuri=${DISCOVERY.URI};"
+  fi
+else
+  [[ -e ${SCRIPT_DIR}/../config/coordinator.conf ]] && source ${SCRIPT_DIR}/../config/coordinator.conf
+
+  params="httpport=${HTTP_SERVER_PORT};querymaxmem=${QUERY_MAX_MEMORY};querymaxmempernode=${QUERY_MAX_MEMORY_PER_NODE};"
+fi
+
+# Get variables from parameters received:
+IFS=\; read -a fields <<<"$params"
+for f in "${fields[@]}"; do
+  param=${f%%=*}
+  value=${f##*=}
+  eval "${param}='${value}'"
+done
+
+# Idenfiy Presto coordinator IP
+coordinator=`serf members | grep 'presto_role=coordinator' | awk '{print \$2}' | cut -f1 -d:`
+
+# Define global properties
+discoveryuri="http://${coordinator}:${httpport}"
+
+# Write configuration properties depending of the role
+if [ "${REEVE_TAG_PRESTO_ROLE}" == "coordinator" ]; then
+cat <<-EOCONFW > /etc/presto/config.properties.new
+coordinator=true
+node-scheduler.include-coordinator=false
+http-server.http.port=${httpport}
+query.max-memory=${querymaxmem}
+query.max-memory-per-node=${querymaxmempernode}
+discovery-server.enabled=true
+discovery.uri=${discoveryuri}
+EOCONFW
+else
+cat <<-EOCONFC > /etc/presto/config.properties.new
+coordinator=false
+http-server.http.port=${httpport}
+query.max-memory=${querymaxmem}
+query.max-memory-per-node=${querymaxmempernode}
+discovery.uri=${discoveryuri}
+EOCONFC
+fi
+
+if diff -q /etc/presto/config.properties /etc/presto/config.properties.new &>/dev/null; then
+  echo "Configuration done -> Presto Server restarted."
+  mv /etc/presto/config.properties.new /etc/presto/config.properties
+  /etc/init.d/presto restart &>/dev/null
+else
+  rm -f /etc/presto/config.properties.new
+fi

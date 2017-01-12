@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+
+if [[ -z "${REEVE_TAG_PRESTO_ROLE}" ]]; then
+  echo "I'm not a Presto node. Ignoring member join."
+  exit 0
+fi
+
+/etc/init.d/presto start | tail -n +2
